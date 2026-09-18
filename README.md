@@ -5,7 +5,8 @@
 ```text
 ql_buhuilida/
 ├─ scripts/                 # 放每个论坛的独立脚本
-│  └─ forum_template.py     # 复制后改成具体论坛
+│  ├─ forum_template.py     # 复制后改成具体论坛
+│  └─ 1000qm_checkin.py     # 阡陌居（www.1000qm.vip）
 ├─ requirements.txt
 └─ .gitignore
 ```
@@ -37,6 +38,16 @@ python scripts/example_forum.py
 
 5. 先点“运行”验证返回内容，再启用定时任务。登录失效时重新获取 Cookie，不要提交到 GitHub。
 
+### 阡陌居签到
+
+环境变量名为 `QM1000_COOKIES`，多账号一行一个 Cookie。签到脚本会先访问签到页获取当日动态 `formhash`，再提交 `dsu_paulsign` 签到请求。
+
+定时任务示例：
+
+```text
+10 8 * * * python3 /ql/data/scripts/1000qm_checkin.py
+```
+
 ## 上传到自己的 GitHub 仓库
 
 在本目录执行：
@@ -61,4 +72,3 @@ git push
 如果 Cookie 曾经误提交到 GitHub，先立即在论坛退出其他会话/刷新 Cookie，再从 Git 历史中清理，不能只删除当前文件。
 
 请确认脚本只用于你有权操作的账号，并遵守目标论坛的服务条款和频率限制。
-
