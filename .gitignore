@@ -1,0 +1,19 @@
+# 本地凭据和运行产物
+.env
+*.local
+*.secret
+cookies.txt
+token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器和系统文件
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+
