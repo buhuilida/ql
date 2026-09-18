@@ -27,7 +27,26 @@ python scripts/example_forum.py
 
 在青龙面板中：
 
-1. **订阅管理** 添加 GitHub 仓库地址，或直接把脚本上传到青龙的 `scripts` 目录。
+1. 可以在青龙终端执行下面的导入命令。
+
+   只导入阡陌居签到脚本（推荐）：
+
+```bash
+ql raw https://raw.githubusercontent.com/buhuilida/ql/main/scripts/1000qm_checkin.py
+```
+
+   或同步仓库中所有签到脚本：
+
+```bash
+ql repo https://github.com/buhuilida/ql.git ".*_checkin\\.py" "" "" "main"
+```
+
+   也可以在 **订阅管理** 添加仓库地址：
+
+```text
+https://github.com/buhuilida/ql.git
+```
+
 2. 安装依赖：`pip3 install -r requirements.txt`（也可在青龙依赖管理中添加 `requests`）。
 3. 在 **环境变量** 添加对应的 Cookie/Token 变量，一行一个账号。
 4. 在 **定时任务** 添加命令，例如：
