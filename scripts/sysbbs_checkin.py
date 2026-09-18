@@ -33,6 +33,7 @@ except ImportError:
 BASE_URL = "https://pc.sysbbs.com"
 REFERER_URL = f"{BASE_URL}/forum-2-1.html"
 SIGN_PAGE = f"{BASE_URL}/k_misign-sign.html"
+CREDIT_PAGE = f"{BASE_URL}/home.php?mod=spacecp&ac=credit"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -83,6 +84,53 @@ def is_logged_in(content: str) -> bool:
         return match.group(1) != "0"
     text = page_text(content)
     return not ("立即登录" in text or "请先登录" in text)
+
+
+def extract_credit_balances(content: str) -> List[Tuple[str, str]]:
+    """解析 Discuz 积分页 creditl 区域中的各项当前余额。"""
+    match = re.search(
+        r"<ul\b[^>]*class\s*=\s*['\"][^'\"]*\bcreditl\b[^'\"]*['\"][^>]*>(.*?)</ul>",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    balances = []
+    for item in re.findall(r"<li\b[^>]*>(.*?)</li>", match.group(1), flags=re.IGNORECASE | re.DOTALL):
+        value_match = re.search(
+            r"<em\b[^>]*>\s*([^:<]+?)\s*[:：]\s*</em>\s*([+-]?[\d,]+(?:\.\d+)?)",
+            item,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not value_match:
+            continue
+        name = page_text(value_match.group(1))
+        value = value_match.group(2).replace(",", "")
+        if name == "星币":
+            balances.append((name, value))
+    return balances
+
+
+def query_credit_balances(cookie: str) -> Tuple[bool, str]:
+    headers = {
+        "User-Agent": os.getenv("SYSBBS_UA", DEFAULT_UA),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": REFERER_URL,
+        "Cookie": cookie,
+    }
+    try:
+        response = requests.get(CREDIT_PAGE, headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return False, f"当前积分查询失败：{exc}"
+
+    if not is_logged_in(response.text):
+        return False, "当前积分查询失败：Cookie 已失效或未登录"
+    balances = extract_credit_balances(response.text)
+    if not balances:
+        return False, "当前积分查询失败：积分页结构可能已变化"
+    return True, "当前签到货币：" + "，".join(f"{name} {value}" for name, value in balances)
 
 
 def has_signed_marker(content: str) -> bool:
@@ -247,7 +295,12 @@ def main() -> None:
     results = []
     for index, cookie in enumerate(accounts, start=1):
         status, message = checkin_once(cookie)
-        line = f"账号 {index}：{message}【{chinese_status(status)}】"
+        _, credit_message = query_credit_balances(cookie)
+        line = (
+            f"账号 {index}：\n"
+            f"- 每日签到：{message}【{chinese_status(status)}】\n"
+            f"- {credit_message}"
+        )
         print(line)
         results.append(line)
 

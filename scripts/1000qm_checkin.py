@@ -40,6 +40,7 @@ SIGN_URL = f"{BASE_URL}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloa
 TASK_PAGE = f"{BASE_URL}/home.php?mod=task"
 TASK_APPLY_URL = f"{BASE_URL}/home.php?mod=task&do=apply&id=1"
 TASK_DONE_URL = f"{BASE_URL}/home.php?mod=task&item=done"
+CREDIT_PAGE = f"{BASE_URL}/home.php?mod=spacecp&ac=credit&showcredit=1"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -92,6 +93,53 @@ def response_message(content: str) -> str:
 def is_logged_in(page: str) -> bool:
     match = re.search(r"\bdiscuz_uid\s*=\s*['\"](\d+)['\"]", page, flags=re.IGNORECASE)
     return not match or match.group(1) != "0"
+
+
+def extract_credit_balances(content: str) -> List[Tuple[str, str]]:
+    """解析 Discuz 积分页 creditl 区域中的各项当前余额。"""
+    match = re.search(
+        r"<ul\b[^>]*class\s*=\s*['\"][^'\"]*\bcreditl\b[^'\"]*['\"][^>]*>(.*?)</ul>",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    balances = []
+    for item in re.findall(r"<li\b[^>]*>(.*?)</li>", match.group(1), flags=re.IGNORECASE | re.DOTALL):
+        value_match = re.search(
+            r"<em\b[^>]*>\s*([^:<]+?)\s*[:：]\s*</em>\s*([+-]?[\d,]+(?:\.\d+)?)",
+            item,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not value_match:
+            continue
+        name = page_text(value_match.group(1))
+        value = value_match.group(2).replace(",", "")
+        if name in ("铜币", "威望"):
+            balances.append((name, value))
+    return balances
+
+
+def query_credit_balances(cookie: str) -> Tuple[bool, str]:
+    headers = {
+        "User-Agent": os.getenv("QM1000_UA", DEFAULT_UA),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": SIGN_PAGE,
+        "Cookie": cookie,
+    }
+    try:
+        response = requests.get(CREDIT_PAGE, headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return False, f"当前积分查询失败：{exc}"
+
+    if not is_logged_in(response.text):
+        return False, "当前积分查询失败：Cookie 已失效或未登录"
+    balances = extract_credit_balances(response.text)
+    if not balances:
+        return False, "当前积分查询失败：积分页结构可能已变化"
+    return True, "当前任务货币：" + "，".join(f"{name} {value}" for name, value in balances)
 
 
 def checkin_once(cookie: str) -> Tuple[str, str]:
@@ -256,10 +304,12 @@ def main() -> None:
     for index, cookie in enumerate(accounts, start=1):
         sign_status, sign_message = checkin_once(cookie)
         task_status, task_message = prestige_task_once(cookie)
+        _, credit_message = query_credit_balances(cookie)
         line = (
             f"账号 {index}：\n"
             f"- 每日签到：{sign_message}【{chinese_status(sign_status)}】\n"
-            f"- 每日威望：{task_message}【{chinese_status(task_status)}】"
+            f"- 每日威望：{task_message}【{chinese_status(task_status)}】\n"
+            f"- {credit_message}"
         )
         print(line)
         results.append(line)
