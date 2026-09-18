@@ -43,6 +43,16 @@ DEFAULT_UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+STATUS_TEXT = {
+    "SUCCESS": "成功",
+    "ALREADY_TODAY": "今日已完成",
+    "NO_LOGIN": "登录失效",
+    "NET_ERR": "网络异常",
+    "PARSE_ERR": "页面解析失败",
+    "NOT_AVAILABLE": "任务不可用",
+    "FAIL": "失败",
+}
+
 
 def read_accounts() -> List[str]:
     raw = os.getenv("QM1000_COOKIES") or os.getenv("QM1000_COOKIE", "")
@@ -192,6 +202,11 @@ def notify(title: str, content: str) -> None:
         ql_send(title, content)
 
 
+def chinese_status(status: str) -> str:
+    """将内部状态码转换为日志和通知使用的中文。"""
+    return STATUS_TEXT.get(status, "未知状态")
+
+
 def main() -> None:
     accounts = read_accounts()
     if not accounts:
@@ -206,8 +221,8 @@ def main() -> None:
         task_status, task_message = prestige_task_once(cookie)
         line = (
             f"账号 {index}：\n"
-            f"- 每日签到：{sign_message} [{sign_status}]\n"
-            f"- 每日威望：{task_message} [{task_status}]"
+            f"- 每日签到：{sign_message}【{chinese_status(sign_status)}】\n"
+            f"- 每日威望：{task_message}【{chinese_status(task_status)}】"
         )
         print(line)
         results.append(line)
