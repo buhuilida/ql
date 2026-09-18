@@ -15,6 +15,9 @@
     QM1000_MOOD     签到心情代码，可选，默认“kx”
 
 Cookie 只从环境变量读取，不要写入脚本或提交到 Git。
+
+PushPlus 通知变量：
+    PUSH_PLUS_TOKEN  PushPlus Token（兼容 PUSHPLUS_TOKEN）
 """
 
 import html
@@ -37,6 +40,7 @@ SIGN_URL = f"{BASE_URL}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloa
 TASK_PAGE = f"{BASE_URL}/home.php?mod=task"
 TASK_APPLY_URL = f"{BASE_URL}/home.php?mod=task&do=apply&id=1"
 TASK_DONE_URL = f"{BASE_URL}/home.php?mod=task&item=done"
+PUSHPLUS_URL = "https://www.pushplus.plus/send"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -197,9 +201,42 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
     return "FAIL", f"每日威望任务返回异常：{message[:200]}"
 
 
-def notify(title: str, content: str) -> None:
+def notify(title: str, content: str) -> bool:
+    """优先直接发送 PushPlus；未配置 Token 时回退青龙 notify.py。"""
+    token = (os.getenv("PUSH_PLUS_TOKEN") or os.getenv("PUSHPLUS_TOKEN", "")).strip()
+    if token:
+        payload = {
+            "token": token,
+            "title": title,
+            "content": content,
+            "template": "txt",
+        }
+        topic = os.getenv("PUSH_PLUS_TOPIC", "").strip()
+        if topic:
+            payload["topic"] = topic
+        try:
+            response = requests.post(PUSHPLUS_URL, json=payload, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("code") == 200:
+                print("PushPlus 通知发送成功。")
+                return True
+            print(f"PushPlus 通知发送失败：{data.get('msg') or data.get('message') or data}")
+        except (requests.RequestException, ValueError) as exc:
+            print(f"PushPlus 通知发送失败：{exc}")
+        return False
+
     if ql_send is not None:
-        ql_send(title, content)
+        try:
+            ql_send(title, content)
+            print("未配置 PUSH_PLUS_TOKEN，已调用青龙通知模块。")
+            return True
+        except Exception as exc:
+            print(f"青龙通知模块调用失败：{exc}")
+            return False
+
+    print("未配置 PUSH_PLUS_TOKEN，且未找到青龙通知模块，未发送通知。")
+    return False
 
 
 def chinese_status(status: str) -> str:
