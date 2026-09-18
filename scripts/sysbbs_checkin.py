@@ -81,6 +81,35 @@ def is_logged_in(content: str) -> bool:
     return not ("立即登录" in text or "请先登录" in text)
 
 
+def has_signed_marker(content: str) -> bool:
+    """识别 k_misign 在页面和按钮中使用的已签到标志。"""
+    text = page_text(content)
+    if any(marker in text for marker in ("已签到", "已经签到", "今日已签", "签到过了", "重复签到")):
+        return True
+    return bool(
+        re.search(
+            r"class\s*=\s*['\"][^'\"]*(?:\bJD_sign\b[^'\"]*\bvisted\b|\bbtnvisted\b)[^'\"]*['\"]",
+            content,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def verify_signed(session: requests.Session, headers: dict) -> Optional[bool]:
+    """签到接口响应不明确时，通过页面按钮状态二次核验。"""
+    checked = False
+    for url in (SIGN_PAGE, REFERER_URL):
+        try:
+            response = session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+        checked = True
+        if has_signed_marker(response.text):
+            return True
+    return False if checked else None
+
+
 def get_formhash(session: requests.Session, headers: dict) -> Tuple[Optional[str], Optional[str]]:
     """按优先级访问常见页面，返回动态 formhash 和错误说明。"""
     last_error = None
@@ -113,6 +142,9 @@ def checkin_once(cookie: str) -> Tuple[str, str]:
     session = requests.Session()
     formhash, error = get_formhash(session, headers)
     if not formhash:
+        signed = verify_signed(session, headers)
+        if signed is True:
+            return "ALREADY_TODAY", "今天已经签到过了"
         if error and "Cookie" in error:
             return "NO_LOGIN", error
         if error and "访问论坛页面失败" in error:
@@ -146,10 +178,15 @@ def checkin_once(cookie: str) -> Tuple[str, str]:
             details.append(f"累计签到 {total.group(1)} 天")
         suffix = "，" + "，".join(details) if details else ""
         return "SUCCESS", f"签到成功{suffix}"
-    if "已签到" in text or "已经签到" in text or "今日已签" in text or "重复签到" in text:
+    if has_signed_marker(response.text):
         return "ALREADY_TODAY", "今天已经签到过了"
     if "请先登录" in text or "需要先登录" in text or "登录后" in text:
         return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
+    signed = verify_signed(session, headers)
+    if signed is True:
+        return "ALREADY_TODAY", "今天已经签到过了"
+    if signed is None:
+        return "NET_ERR", "签到接口未返回结果，且无法联网核验签到状态"
     return "FAIL", f"签到接口返回异常：{text[:200] or '响应内容为空'}"
 
 
@@ -182,4 +219,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
