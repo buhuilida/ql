@@ -23,6 +23,13 @@ class SouShuBaHelpersTests(unittest.TestCase):
             module.extract_latest_url(page, "https://publish.test/sou/go.html"),
         )
 
+    def test_extract_named_latest_link_from_interstitial_page(self):
+        page = '<a class="link" href="https://main.test/">最新地址</a>'
+        self.assertEqual(
+            ["https://main.test/"],
+            module.extract_named_links(page, "https://relay.test/"),
+        )
+
     def test_extract_hidden_fields_and_credit(self):
         page = (
             '<input type="hidden" name="formhash" value="abc123">'

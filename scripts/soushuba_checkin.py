@@ -15,6 +15,7 @@
     SOUSHUBA_MESSAGE  记录内容，可选
     SOUSHUBA_PUBLISH_URL 地址发布页，可选，默认取抓包中的发布页
     SOUSHUBA_UA       User-Agent，可选
+    SOUSHUBA_VERIFY_SSL 是否严格校验主站证书，1 开启；默认 0（该站证书链不完整）
 
 PushPlus：PUSH_PLUS_TOKEN（兼容 PUSHPLUS_TOKEN），可选 PUSH_PLUS_TOPIC。
 
@@ -29,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
+import urllib3
 
 try:
     from notify import send as ql_send
@@ -81,7 +83,8 @@ def response_text(response: requests.Response) -> str:
         return response.content.decode("gb18030", errors="replace")
     if charset:
         return response.content.decode(charset, errors="replace")
-    return response.text
+    encoding = response.apparent_encoding or "utf-8"
+    return response.content.decode(encoding, errors="replace")
 
 
 def page_text(content: str) -> str:
@@ -151,6 +154,21 @@ def extract_latest_url(content: str, base_url: str) -> Optional[str]:
     return urls[0] if urls else None
 
 
+def extract_named_links(content: str, base_url: str, label: str = "最新地址") -> List[str]:
+    """从中转页提取带有指定文字的链接，例如“最新地址”。"""
+    links = []
+    for attrs, inner in re.findall(r"<a\b([^>]*)>(.*?)</a\s*>", content, re.I | re.S):
+        if label not in page_text(inner):
+            continue
+        match = re.search(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", attrs, re.I)
+        if not match:
+            continue
+        target = urljoin(base_url, html.unescape(match.group(1).strip()))
+        if target not in links:
+            links.append(target)
+    return links
+
+
 def follow_meta_refresh(session: requests.Session, response: requests.Response) -> requests.Response:
     """requests 不执行 HTML meta refresh，这里补上发布页的两级跳转。"""
     current = response
@@ -167,8 +185,12 @@ def follow_meta_refresh(session: requests.Session, response: requests.Response) 
             return current
         target = urljoin(current.url, html.unescape(match.group(1)))
         try:
-            current = session.get(target, timeout=20, allow_redirects=True)
-            current.raise_for_status()
+            current = session.get(
+                target,
+                headers={"Referer": current.url},
+                timeout=20,
+                allow_redirects=True,
+            )
         except requests.RequestException:
             return current
     return current
@@ -179,21 +201,41 @@ def resolve_main_url(session: requests.Session) -> Optional[str]:
     try:
         publish = session.get(publish_url, timeout=20, allow_redirects=True)
         publish.raise_for_status()
+        # 发布页首页通常只通过 meta refresh 跳到 /sou/go.html，最新地址数组在后者中。
+        publish = follow_meta_refresh(session, publish)
         content = response_text(publish)
         targets = extract_latest_urls(content, publish.url)
         if not targets:
             return None
-        for target in targets:
-            try:
-                target_resp = session.get(target, timeout=20, allow_redirects=True)
-                target_resp.raise_for_status()
-                target_resp = follow_meta_refresh(session, target_resp)
-                target_text = response_text(target_resp)
-                if re.search(r"Powered by Discuz|discuz_uid|name\s*=\s*['\"]formhash['\"]", target_text, re.I):
-                    parsed = urlparse(target_resp.url)
-                    return f"{parsed.scheme}://{parsed.netloc}/"
-            except requests.RequestException:
+        visited = set()
+        pending = list(targets)
+        for _ in range(12):
+            if not pending:
+                break
+            target = pending.pop(0)
+            if target in visited:
                 continue
+            visited.add(target)
+            for _attempt in range(3):
+                try:
+                    target_resp = session.get(
+                        target,
+                        headers={"Referer": publish.url},
+                        timeout=20,
+                        allow_redirects=True,
+                    )
+                    target_resp = follow_meta_refresh(session, target_resp)
+                    target_text = response_text(target_resp)
+                    if re.search(r"Powered by Discuz|discuz_uid|name\s*=\s*['\"]formhash['\"]", target_text, re.I):
+                        parsed = urlparse(target_resp.url)
+                        return f"{parsed.scheme}://{parsed.netloc}/"
+                    named_links = extract_named_links(target_text, target_resp.url)
+                    if named_links:
+                        # 中转页明确标记的“最新地址”就是主站入口，无需依赖主站证书来完成地址解析。
+                        parsed = urlparse(named_links[0])
+                        return f"{parsed.scheme}://{parsed.netloc}/"
+                except requests.RequestException:
+                    continue
     except requests.RequestException:
         return None
     return None
@@ -222,10 +264,16 @@ def has_today_record(content: str, now: Optional[datetime] = None) -> bool:
 
 
 def run_account(cookie: str) -> Tuple[str, str]:
-    session = make_session(cookie)
-    main_url = resolve_main_url(session)
+    # 地址发现过程不携带账号 Cookie，避免凭据发送给发布页或中转站。
+    discovery_session = make_session("")
+    main_url = resolve_main_url(discovery_session)
     if not main_url:
         return "PARSE_ERR", "发布页未解析到可用的搜书吧主站地址"
+    session = make_session(cookie)
+    verify_ssl = os.getenv("SOUSHUBA_VERIFY_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
+    session.verify = verify_ssl
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     headers = {"Referer": main_url}
     try:
         home = session.get(main_url, headers=headers, timeout=20)
