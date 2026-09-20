@@ -24,6 +24,7 @@ import html
 import os
 import re
 from typing import List, Optional, Tuple
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
@@ -38,7 +39,8 @@ BASE_URL = "https://www.1000qm.vip"
 SIGN_PAGE = f"{BASE_URL}/plugin.php?id=dsu_paulsign:sign"
 SIGN_URL = f"{BASE_URL}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
 TASK_PAGE = f"{BASE_URL}/home.php?mod=task"
-TASK_APPLY_URL = f"{BASE_URL}/home.php?mod=task&do=apply&id=1"
+TASK_DRAW_URL = f"{BASE_URL}/home.php?mod=task&do=draw&id=1"
+TASK_DOING_URL = f"{BASE_URL}/home.php?mod=task&item=doing"
 TASK_DONE_URL = f"{BASE_URL}/home.php?mod=task&item=done"
 CREDIT_PAGE = f"{BASE_URL}/home.php?mod=spacecp&ac=credit&showcredit=1"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
@@ -92,7 +94,50 @@ def response_message(content: str) -> str:
 
 def is_logged_in(page: str) -> bool:
     match = re.search(r"\bdiscuz_uid\s*=\s*['\"](\d+)['\"]", page, flags=re.IGNORECASE)
-    return not match or match.group(1) != "0"
+    if match:
+        return match.group(1) != "0"
+    login_form = re.search(
+        r"member\.php\?mod=logging(?:&amp;|&)action=login|\bname\s*=\s*['\"]username['\"]",
+        page,
+        flags=re.IGNORECASE,
+    )
+    return login_form is None
+
+
+def authenticated_session(cookie: str) -> requests.Session:
+    """将 Cookie 放入 CookieJar，确保 Discuz 重定向后仍保持登录态。"""
+    session = requests.Session()
+    for part in cookie.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name:
+            session.cookies.set(name, value)
+    return session
+
+
+def extract_task_action_url(page: str, action: str, task_id: int = 1) -> Optional[str]:
+    """从任务页提取指定任务的操作链接，不依赖查询参数顺序。"""
+    for raw_url in re.findall(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", page, flags=re.IGNORECASE):
+        url = urljoin(f"{BASE_URL}/", html.unescape(raw_url))
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        if (
+            parsed.path.endswith("/home.php")
+            and query.get("mod") == ["task"]
+            and query.get("do") == [action]
+            and query.get("id") == [str(task_id)]
+        ):
+            return url
+    return None
+
+
+def completed_task_message(page: str) -> Optional[str]:
+    """识别已领取任务及下次可申请时间。"""
+    text = page_text(page)
+    if "每日威望红包" not in text or "后可以再次申请" not in text:
+        return None
+    next_time = re.search(r"(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})\s*后可以再次申请", text)
+    suffix = f"，{next_time.group(1)} 后可再次申请" if next_time else ""
+    return f"每日威望红包今天已经领取{suffix}"
 
 
 def extract_credit_balances(content: str) -> List[Tuple[str, str]]:
@@ -202,9 +247,8 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
         "User-Agent": os.getenv("QM1000_UA", DEFAULT_UA),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": TASK_PAGE,
-        "Cookie": cookie,
     }
-    session = requests.Session()
+    session = authenticated_session(cookie)
 
     try:
         task_resp = session.get(TASK_PAGE, headers=headers, timeout=20)
@@ -216,37 +260,75 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
     if not is_logged_in(task_page):
         return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
 
-    # 只有任务 ID 1 的申请链接存在时才执行，避免误领其他任务。
-    apply_pattern = r"home\.php\?mod=task(?:&amp;|&)do=apply(?:&amp;|&)id=1(?:[\"'&<]|$)"
-    if not re.search(apply_pattern, task_page, flags=re.IGNORECASE):
+    apply_url = extract_task_action_url(task_page, "apply")
+    applied_now = apply_url is not None
+    if apply_url:
         try:
-            done_resp = session.get(TASK_DONE_URL, headers=headers, timeout=20)
-            done_resp.raise_for_status()
+            apply_resp = session.get(apply_url, headers=headers, timeout=20, allow_redirects=True)
+            apply_resp.raise_for_status()
         except requests.RequestException as exc:
-            return "NET_ERR", f"查询威望任务状态失败：{exc}"
+            return "NET_ERR", f"申请每日威望红包失败：{exc}"
 
-        done_text = page_text(done_resp.text)
-        if "每日威望红包" in done_text and "后可以再次申请" in done_text:
-            next_time = re.search(r"(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})\s*后可以再次申请", done_text)
-            suffix = f"，{next_time.group(1)} 后可再次申请" if next_time else ""
-            return "ALREADY_TODAY", f"每日威望红包今天已经领取{suffix}"
-        return "NOT_AVAILABLE", "未找到可申请的每日威望红包任务"
+        if not is_logged_in(apply_resp.text):
+            return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
+    else:
+        apply_resp = None
 
     try:
-        # apply 会由服务器 302 到 draw，requests 跟随重定向完成奖励领取。
-        result = session.get(TASK_APPLY_URL, headers=headers, timeout=20, allow_redirects=True)
-        result.raise_for_status()
+        doing_resp = session.get(TASK_DOING_URL, headers=headers, timeout=20)
+        doing_resp.raise_for_status()
     except requests.RequestException as exc:
-        return "NET_ERR", f"申请每日威望红包失败：{exc}"
+        return "NET_ERR", f"查询进行中的威望任务失败：{exc}"
 
-    message = page_text(result.text)
-    if "任务已成功完成" in message:
-        return "SUCCESS", "每日威望红包领取成功，威望 +1"
-    if "已经申请" in message or "下次申请" in message or "不能申请" in message:
-        return "ALREADY_TODAY", "每日威望红包今天已经领取"
-    if "登录" in message and ("请先" in message or "需要" in message):
+    if not is_logged_in(doing_resp.text):
         return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
-    return "FAIL", f"每日威望任务返回异常：{message[:200]}"
+
+    draw_url = extract_task_action_url(doing_resp.text, "draw")
+    if not draw_url:
+        draw_url = extract_task_action_url(task_page, "draw")
+    if not draw_url and apply_resp is not None:
+        draw_url = extract_task_action_url(apply_resp.text, "draw")
+
+    # 部分模板不输出领取链接，但 Discuz 的领取端点仍固定为 do=draw&id=1。
+    if not draw_url and applied_now:
+        draw_url = TASK_DRAW_URL
+
+    if draw_url:
+        draw_headers = dict(headers)
+        draw_headers["Referer"] = TASK_DOING_URL
+        try:
+            result = session.get(draw_url, headers=draw_headers, timeout=20, allow_redirects=True)
+            result.raise_for_status()
+        except requests.RequestException as exc:
+            return "NET_ERR", f"领取每日威望红包失败：{exc}"
+
+        if not is_logged_in(result.text):
+            return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
+
+        message = page_text(result.text)
+        success_markers = ("任务已成功完成", "任务奖励已领取", "恭喜您完成任务")
+        if any(marker in message for marker in success_markers):
+            return "SUCCESS", "每日威望红包领取成功，威望 +1"
+
+    try:
+        done_resp = session.get(TASK_DONE_URL, headers=headers, timeout=20)
+        done_resp.raise_for_status()
+    except requests.RequestException as exc:
+        return "NET_ERR", f"核验威望任务状态失败：{exc}"
+
+    if not is_logged_in(done_resp.text):
+        return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
+
+    done_message = completed_task_message(done_resp.text)
+    if done_message:
+        if applied_now or draw_url:
+            return "SUCCESS", "每日威望红包领取成功，威望 +1"
+        return "ALREADY_TODAY", done_message
+
+    if draw_url:
+        message = page_text(result.text)
+        return "FAIL", f"领取威望奖励后状态核验失败：{message[:200] or '响应内容为空'}"
+    return "NOT_AVAILABLE", "未找到可申请或可领取的每日威望红包任务"
 
 
 def notify(title: str, content: str) -> bool:
