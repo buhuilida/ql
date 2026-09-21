@@ -8,6 +8,7 @@
 1. 访问地址发布页并解析最新地址；
 2. 使用 Cookie 访问主站，确认登录态；
 3. 每天发表一条记录，默认内容为“记录打卡，爱上搜书吧”。
+4. 查询系统奖励和积分页，确认当天登录奖励及当前银币。
 
 青龙环境变量：
     SOUSHUBA_COOKIES  多账号 Cookie，一行一个；也支持用 | 分隔
@@ -42,6 +43,9 @@ PUBLISH_URL = "https://upyt.fv1e5dg5eas.com/"
 DOING_URL_PATH = "/home.php?mod=space&do=doing&view=me&from=space"
 DOING_POST_PATH = "/home.php?mod=spacecp&ac=doing&view=me"
 CREDIT_URL_PATH = "/home.php?mod=spacecp&ac=credit&showcredit=1"
+CREDIT_RULE_LOG_PATH = (
+    "/home.php?mod=spacecp&ac=credit&op=log&suboperation=creditrulelog"
+)
 DEFAULT_MESSAGE = "记录打卡，爱上搜书吧"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -254,6 +258,43 @@ def extract_credit(content: str) -> Optional[str]:
     return match.group(1).replace(",", "") if match else None
 
 
+def extract_reward_entry(
+    content: str, action_name: str, credit_name: str = "银币"
+) -> Optional[Tuple[int, str]]:
+    """从 Discuz“系统奖励”表读取某动作最近一次奖励及时间。"""
+    for table in re.findall(r"<table\b[^>]*>(.*?)</table>", content, re.I | re.S):
+        rows = []
+        for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", table, re.I | re.S):
+            cells = [
+                page_text(cell)
+                for cell in re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, re.I | re.S)
+            ]
+            if cells:
+                rows.append(cells)
+        if not rows or credit_name not in rows[0]:
+            continue
+        credit_index = rows[0].index(credit_name)
+        for cells in rows[1:]:
+            if not cells or cells[0] != action_name or credit_index >= len(cells):
+                continue
+            amount_match = re.search(r"[+-]?\d[\d,]*", cells[credit_index])
+            time_match = re.search(
+                r"\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?",
+                cells[-1],
+            )
+            if amount_match and time_match:
+                return int(amount_match.group(0).replace(",", "")), time_match.group(0)
+    return None
+
+
+def is_today(value: str, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now()
+    match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", value)
+    if not match:
+        return False
+    return tuple(map(int, match.groups())) == (now.year, now.month, now.day)
+
+
 def has_today_record(content: str, now: Optional[datetime] = None) -> bool:
     now = now or datetime.now()
     today = rf"{now.year}-0?{now.month}-0?{now.day}"
@@ -263,28 +304,9 @@ def has_today_record(content: str, now: Optional[datetime] = None) -> bool:
     return False
 
 
-def run_account(cookie: str) -> Tuple[str, str]:
-    # 地址发现过程不携带账号 Cookie，避免凭据发送给发布页或中转站。
-    discovery_session = make_session("")
-    main_url = resolve_main_url(discovery_session)
-    if not main_url:
-        return "PARSE_ERR", "发布页未解析到可用的搜书吧主站地址"
-    session = make_session(cookie)
-    verify_ssl = os.getenv("SOUSHUBA_VERIFY_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
-    session.verify = verify_ssl
-    if not verify_ssl:
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    headers = {"Referer": main_url}
-    try:
-        home = session.get(main_url, headers=headers, timeout=20)
-        home.raise_for_status()
-    except requests.RequestException as exc:
-        return "NET_ERR", f"打开搜书吧主站失败：{exc}"
-    home_content = response_text(home)
-    if not is_logged_in(home_content):
-        return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
-
-    credit_before = extract_credit(home_content)
+def publish_record(
+    session: requests.Session, main_url: str, headers: Dict[str, str]
+) -> Tuple[str, str]:
     doing_url = urljoin(main_url, DOING_URL_PATH)
     try:
         doing = session.get(doing_url, headers=headers, timeout=20)
@@ -295,7 +317,7 @@ def run_account(cookie: str) -> Tuple[str, str]:
     if not is_logged_in(doing_content):
         return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
     if has_today_record(doing_content):
-        return "ALREADY_TODAY", f"今天已经发表记录，当前银币 {credit_before or '未知'}"
+        return "ALREADY_TODAY", "今天已经发表记录"
 
     formhash = extract_formhash(doing_content)
     if not formhash:
@@ -311,7 +333,13 @@ def run_account(cookie: str) -> Tuple[str, str]:
     post_url = urljoin(main_url, DOING_POST_PATH)
     post_headers = {"Referer": doing_url, "Content-Type": "application/x-www-form-urlencoded"}
     try:
-        result = session.post(post_url, data=payload, headers=post_headers, timeout=20, allow_redirects=True)
+        result = session.post(
+            post_url,
+            data=payload,
+            headers=post_headers,
+            timeout=20,
+            allow_redirects=True,
+        )
         result.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"发表记录失败：{exc}"
@@ -320,9 +348,83 @@ def run_account(cookie: str) -> Tuple[str, str]:
         return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
     if payload["message"] not in result_content and result.url != doing_url:
         return "FAIL", "发表记录请求已返回，但未在结果页确认记录内容"
-    credit_after = extract_credit(result_content)
-    credit_message = f"，当前银币 {credit_after}" if credit_after else ""
-    return "SUCCESS", f"记录发表成功{credit_message}"
+    return "SUCCESS", "记录发表成功"
+
+
+def check_daily_login_reward(
+    session: requests.Session,
+    main_url: str,
+    headers: Dict[str, str],
+    now: Optional[datetime] = None,
+) -> Tuple[str, str]:
+    reward_url = urljoin(main_url, CREDIT_RULE_LOG_PATH)
+    try:
+        response = session.get(reward_url, headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return "NET_ERR", f"查询每天登录奖励失败：{exc}"
+    content = response_text(response)
+    if not is_logged_in(content):
+        return "NO_LOGIN", "Cookie 已失效，无法查询每天登录奖励"
+    entry = extract_reward_entry(content, "每天登录")
+    if entry is None:
+        return "PARSE_ERR", "系统奖励中未找到“每天登录”记录"
+    amount, award_time = entry
+    if not is_today(award_time, now):
+        return "FAIL", f"今天尚未获得登录银币（最近奖励：{award_time}）"
+    return "SUCCESS", f"今天登录已获得 {amount} 银币"
+
+
+def get_current_credit(
+    session: requests.Session, main_url: str, headers: Dict[str, str]
+) -> Optional[str]:
+    try:
+        response = session.get(urljoin(main_url, CREDIT_URL_PATH), headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+    content = response_text(response)
+    return extract_credit(content) if is_logged_in(content) else None
+
+
+def run_account(cookie: str) -> Tuple[str, str]:
+    # 地址发现过程不携带账号 Cookie，避免凭据发送给发布页或中转站。
+    discovery_session = make_session("")
+    main_url = resolve_main_url(discovery_session)
+    if not main_url:
+        return "PARSE_ERR", "发布页未解析到可用的搜书吧主站地址"
+    session = make_session(cookie)
+    verify_ssl = os.getenv("SOUSHUBA_VERIFY_SSL", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    session.verify = verify_ssl
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    headers = {"Referer": main_url}
+    try:
+        home = session.get(main_url, headers=headers, timeout=20)
+        home.raise_for_status()
+    except requests.RequestException as exc:
+        return "NET_ERR", f"打开搜书吧主站失败：{exc}"
+    home_content = response_text(home)
+    if not is_logged_in(home_content):
+        return "NO_LOGIN", "Cookie 已失效或未登录，请重新获取 Cookie"
+
+    record_status, record_message = publish_record(session, main_url, headers)
+    login_status, login_message = check_daily_login_reward(session, main_url, headers)
+    current_credit = get_current_credit(session, main_url, headers)
+    credit_message = f"当前银币 {current_credit}" if current_credit else "当前银币未知"
+
+    if login_status != "SUCCESS":
+        status = login_status
+    elif record_status == "ALREADY_TODAY":
+        status = "ALREADY_TODAY"
+    else:
+        status = record_status
+    return status, f"{login_message}；{record_message}；{credit_message}"
 
 
 def notify(title: str, content: str) -> bool:

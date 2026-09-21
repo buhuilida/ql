@@ -38,6 +38,33 @@ class SouShuBaHelpersTests(unittest.TestCase):
         self.assertEqual("abc123", module.extract_formhash(page))
         self.assertEqual("69", module.extract_credit(page))
 
+    def test_extract_daily_login_reward_from_system_reward_table(self):
+        page = '''
+        <table class="dt">
+          <tr>
+            <th>动作名称</th><th>总次数</th><th>周期次数</th>
+            <th>银币</th><th>最后奖励时间</th>
+          </tr>
+          <tr>
+            <td><a href="rule&amp;rid=1">发表记录</a></td>
+            <td>8</td><td>1</td><td>+1</td><td>2026-09-21 08:14</td>
+          </tr>
+          <tr class="alt">
+            <td><a href="rule&amp;rid=2">每天登录</a></td>
+            <td>20</td><td>1</td><td>+2</td><td>2026-09-21 08:15</td>
+          </tr>
+        </table>
+        '''
+        self.assertEqual(
+            (2, "2026-09-21 08:15"),
+            module.extract_reward_entry(page, "每天登录"),
+        )
+
+    def test_daily_reward_date_must_be_today(self):
+        now = datetime(2026, 9, 21, 8, 20)
+        self.assertTrue(module.is_today("2026-09-21 08:15", now))
+        self.assertFalse(module.is_today("2026-09-20 23:59", now))
+
     def test_detect_today_record_without_matching_footer_date(self):
         page = (
             '<dd class="ptn xg1"><span class="y">2026-09-20 08:00</span></dd>'
