@@ -27,9 +27,13 @@ class FakeSession:
         self.responses = list(responses)
         self.urls = []
 
-    def get(self, url, **kwargs):
+    def request(self, method, url, **kwargs):
+        # 脚本统一经 http_request() 走 session.request()，此处保持同样接口
         self.urls.append(url)
         return self.responses.pop(0)
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
 
 
 class PrestigeTaskTests(unittest.TestCase):

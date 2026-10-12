@@ -23,6 +23,7 @@ PushPlus 通知变量：
 import html
 import os
 import re
+import time
 from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -49,6 +50,32 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# 阡陌居动态页偶发慢响应：原 timeout=20 太紧，一次卡顿就整轮判为网络异常。
+# 改为可调超时 + 自动重试，让瞬时慢响应在本轮内自愈。
+TIMEOUT = float(os.getenv("QM1000_TIMEOUT", "60"))
+RETRIES = max(1, int(os.getenv("QM1000_RETRIES", "3")))
+RETRY_BACKOFF = float(os.getenv("QM1000_RETRY_BACKOFF", "3"))
+
+
+def http_request(method, url, *, headers=None, session=None, retries=None, **kwargs):
+    """带重试的 HTTP 请求，缓解阡陌居偶发慢响应导致的整轮网络异常。
+
+    成功返回 Response（此处不调用 raise_for_status，交由调用方按原逻辑处理）；
+    重试耗尽后抛出最后一次 requests.RequestException。
+    """
+    sess = session or requests
+    kwargs.setdefault("timeout", TIMEOUT)
+    attempts = retries or RETRIES
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return sess.request(method, url, headers=headers, **kwargs)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(RETRY_BACKOFF * attempt)
+    raise last_exc
 
 STATUS_TEXT = {
     "SUCCESS": "成功",
@@ -174,7 +201,7 @@ def query_credit_balances(cookie: str) -> Tuple[bool, str]:
         "Cookie": cookie,
     }
     try:
-        response = requests.get(CREDIT_PAGE, headers=headers, timeout=20)
+        response = http_request("GET", CREDIT_PAGE, headers=headers)
         response.raise_for_status()
     except requests.RequestException as exc:
         return False, f"当前积分查询失败：{exc}"
@@ -198,7 +225,7 @@ def checkin_once(cookie: str) -> Tuple[str, str]:
     session = requests.Session()
 
     try:
-        page_resp = session.get(SIGN_PAGE, headers=headers, timeout=20)
+        page_resp = http_request("GET", SIGN_PAGE, headers=headers, session=session)
         page_resp.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"打开签到页失败：{exc}"
@@ -226,7 +253,7 @@ def checkin_once(cookie: str) -> Tuple[str, str]:
     post_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
     try:
-        result = session.post(SIGN_URL, data=payload, headers=post_headers, timeout=20)
+        result = http_request("POST", SIGN_URL, headers=post_headers, session=session, data=payload)
         result.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"提交签到请求失败：{exc}"
@@ -251,7 +278,7 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
     session = authenticated_session(cookie)
 
     try:
-        task_resp = session.get(TASK_PAGE, headers=headers, timeout=20)
+        task_resp = http_request("GET", TASK_PAGE, headers=headers, session=session)
         task_resp.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"打开任务中心失败：{exc}"
@@ -264,7 +291,7 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
     applied_now = apply_url is not None
     if apply_url:
         try:
-            apply_resp = session.get(apply_url, headers=headers, timeout=20, allow_redirects=True)
+            apply_resp = http_request("GET", apply_url, headers=headers, session=session, allow_redirects=True)
             apply_resp.raise_for_status()
         except requests.RequestException as exc:
             return "NET_ERR", f"申请每日威望红包失败：{exc}"
@@ -275,7 +302,7 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
         apply_resp = None
 
     try:
-        doing_resp = session.get(TASK_DOING_URL, headers=headers, timeout=20)
+        doing_resp = http_request("GET", TASK_DOING_URL, headers=headers, session=session)
         doing_resp.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"查询进行中的威望任务失败：{exc}"
@@ -297,7 +324,7 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
         draw_headers = dict(headers)
         draw_headers["Referer"] = TASK_DOING_URL
         try:
-            result = session.get(draw_url, headers=draw_headers, timeout=20, allow_redirects=True)
+            result = http_request("GET", draw_url, headers=draw_headers, session=session, allow_redirects=True)
             result.raise_for_status()
         except requests.RequestException as exc:
             return "NET_ERR", f"领取每日威望红包失败：{exc}"
@@ -311,7 +338,7 @@ def prestige_task_once(cookie: str) -> Tuple[str, str]:
             return "SUCCESS", "每日威望红包领取成功，威望 +1"
 
     try:
-        done_resp = session.get(TASK_DONE_URL, headers=headers, timeout=20)
+        done_resp = http_request("GET", TASK_DONE_URL, headers=headers, session=session)
         done_resp.raise_for_status()
     except requests.RequestException as exc:
         return "NET_ERR", f"核验威望任务状态失败：{exc}"
@@ -345,7 +372,7 @@ def notify(title: str, content: str) -> bool:
         if topic:
             payload["topic"] = topic
         try:
-            response = requests.post(PUSHPLUS_URL, json=payload, timeout=20)
+            response = http_request("POST", PUSHPLUS_URL, json=payload)
             response.raise_for_status()
             data = response.json()
             if data.get("code") == 200:
