@@ -94,5 +94,67 @@ class PrestigeTaskTests(unittest.TestCase):
         self.assertIn("token=value=with=equals", prepared.headers["Cookie"])
 
 
+class HttpRequestRetryTests(unittest.TestCase):
+    """http_request()：传输层异常与 5xx 的重试策略。"""
+
+    def test_retries_5xx_on_get_then_succeeds(self):
+        session = FakeSession(
+            [
+                FakeResponse("busy", status_code=503),
+                FakeResponse("ok", status_code=200),
+            ]
+        )
+        with patch.object(qm_checkin.time, "sleep", return_value=None):
+            response = qm_checkin.http_request("GET", "https://x/", session=session)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(session.urls))
+
+    def test_returns_last_5xx_after_exhausting_retries(self):
+        session = FakeSession([FakeResponse("busy", status_code=503)] * 3)
+        with patch.object(qm_checkin.time, "sleep", return_value=None):
+            response = qm_checkin.http_request(
+                "GET", "https://x/", session=session, retries=3
+            )
+
+        # 重试耗尽后返回最后一次响应，交由调用方 raise_for_status 按原逻辑报错
+        self.assertEqual(503, response.status_code)
+        self.assertEqual(3, len(session.urls))
+
+    def test_does_not_retry_5xx_on_post(self):
+        session = FakeSession([FakeResponse("busy", status_code=503)])
+        with patch.object(qm_checkin.time, "sleep", return_value=None):
+            response = qm_checkin.http_request("POST", "https://x/", session=session)
+
+        # 写操作不做 5xx 重试，避免重复提交
+        self.assertEqual(503, response.status_code)
+        self.assertEqual(1, len(session.urls))
+
+    def test_does_not_retry_4xx(self):
+        session = FakeSession([FakeResponse("nope", status_code=403)])
+        with patch.object(qm_checkin.time, "sleep", return_value=None):
+            response = qm_checkin.http_request("GET", "https://x/", session=session)
+
+        # 4xx（登录失效等）判定逻辑保持不变，不重试
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(1, len(session.urls))
+
+    def test_retries_transport_error_then_raises(self):
+        class DeadSession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, method, url, **kwargs):
+                self.calls += 1
+                raise qm_checkin.requests.exceptions.ReadTimeout("read timed out")
+
+        session = DeadSession()
+        with patch.object(qm_checkin.time, "sleep", return_value=None):
+            with self.assertRaises(qm_checkin.requests.exceptions.ReadTimeout):
+                qm_checkin.http_request("GET", "https://x/", session=session, retries=2)
+
+        self.assertEqual(2, session.calls)
+
+
 if __name__ == "__main__":
     unittest.main()

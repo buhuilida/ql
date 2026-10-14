@@ -57,25 +57,43 @@ TIMEOUT = float(os.getenv("QM1000_TIMEOUT", "60"))
 RETRIES = max(1, int(os.getenv("QM1000_RETRIES", "3")))
 RETRY_BACKOFF = float(os.getenv("QM1000_RETRY_BACKOFF", "3"))
 
+# 站点过载时会直接返回 503（Service Temporarily Unavailable），属瞬时故障，
+# 例如 2026-10-14 08:10「打开任务中心」即被 503 打断。这类错误值得重试。
+# 只对幂等方法重试，避免 POST（签到/申请/领奖）被重复提交。
+RETRY_STATUS = {500, 502, 503, 504}
+IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS"}
+
 
 def http_request(method, url, *, headers=None, session=None, retries=None, **kwargs):
-    """带重试的 HTTP 请求，缓解阡陌居偶发慢响应导致的整轮网络异常。
+    """带重试的 HTTP 请求，缓解阡陌居偶发慢响应/过载导致的整轮网络异常。
 
-    成功返回 Response（此处不调用 raise_for_status，交由调用方按原逻辑处理）；
-    重试耗尽后抛出最后一次 requests.RequestException。
+    成功返回 Response（此处不调用 raise_for_status，交由调用方按原逻辑处理）。
+    重试耗尽后：
+      * 传输层异常（超时/连接错误）→ 抛出最后一次 requests.RequestException；
+      * 5xx → 返回最后一次的 Response，由调用方按原逻辑判定（保持既有报错文案）。
+
+    重试对象：
+      * 传输层异常 —— 所有方法；
+      * 5xx（500/502/503/504）—— 仅幂等方法，避免重复提交写操作。
     """
     sess = session or requests
     kwargs.setdefault("timeout", TIMEOUT)
     attempts = retries or RETRIES
-    last_exc = None
+    idempotent = method.upper() in IDEMPOTENT_METHODS
+
     for attempt in range(1, attempts + 1):
         try:
-            return sess.request(method, url, headers=headers, **kwargs)
-        except requests.RequestException as exc:
-            last_exc = exc
+            response = sess.request(method, url, headers=headers, **kwargs)
+        except requests.RequestException:
             if attempt < attempts:
                 time.sleep(RETRY_BACKOFF * attempt)
-    raise last_exc
+                continue
+            raise
+        if idempotent and response.status_code in RETRY_STATUS and attempt < attempts:
+            time.sleep(RETRY_BACKOFF * attempt)
+            continue
+        return response
+
 
 STATUS_TEXT = {
     "SUCCESS": "成功",
